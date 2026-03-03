@@ -1,0 +1,7 @@
+streamlit
+openai
+python-dotenv
+python-docx
+pymupdf
+psycopg2-binary
+supabase
