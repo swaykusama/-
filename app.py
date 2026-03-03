@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-#   洞察整理大师 app.py 云端版（Supabase）
+#   洞察整理大师 app.py 云端修复版
 # ════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -7,6 +7,7 @@ import os
 import io
 import json
 import time
+import requests
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -15,11 +16,10 @@ from supabase import create_client
 load_dotenv()
 
 # ══════════════════════════════════════════
-# 初始化：密钥 + Supabase 客户端
+# 初始化
 # ══════════════════════════════════════════
 
 def get_secret(key):
-  """本地从 .env 读，云端从 Streamlit Secrets 读"""
   try:
       return st.secrets[key]
   except Exception:
@@ -27,27 +27,24 @@ def get_secret(key):
 
 @st.cache_resource
 def get_supabase():
-  """获取 Supabase 客户端（全局只创建一次）"""
   return create_client(
       get_secret("SUPABASE_URL"),
       get_secret("SUPABASE_KEY")
   )
 
 # ══════════════════════════════════════════
-# 数据库：文档
+# 文档操作
 # ══════════════════════════════════════════
 
 def save_document(file_bytes, original_name, source, industry, year):
   sb          = get_supabase()
   stored_name = f"{int(time.time())}_{original_name}"
   file_url    = ""
-
   try:
       sb.storage.from_("documents").upload(stored_name, file_bytes)
       file_url = sb.storage.from_("documents").get_public_url(stored_name)
   except Exception as e:
       st.warning(f"文件上传失败：{e}")
-
   result = sb.table("documents").insert({
       "original_name": original_name,
       "stored_name":   stored_name,
@@ -56,19 +53,17 @@ def save_document(file_bytes, original_name, source, industry, year):
       "industry":      industry,
       "year":          year
   }).execute()
-
   return result.data[0]["id"] if result.data else None
 
 def get_document(doc_id):
   if not doc_id:
       return None
-  sb     = get_supabase()
-  result = sb.table("documents").select("*").eq("id", doc_id).execute()
+  result = get_supabase().table("documents").select("*").eq("id", doc_id).execute()
   return result.data[0] if result.data else None
 
 def get_all_documents():
-  sb = get_supabase()
-  return sb.table("documents").select("*").order("created_at", desc=True).execute().data or []
+  return get_supabase().table("documents").select("*").order(
+      "created_at", desc=True).execute().data or []
 
 def delete_document(doc_id):
   sb  = get_supabase()
@@ -81,20 +76,28 @@ def delete_document(doc_id):
   sb.table("documents").delete().eq("id", doc_id).execute()
   sb.table("insights").update({"document_id": None}).eq("document_id", doc_id).execute()
 
-def get_file_bytes(stored_name):
-  """从 Supabase Storage 下载文件内容"""
-  try:
-      return get_supabase().storage.from_("documents").download(stored_name)
-  except Exception:
-      return None
+def get_file_bytes(stored_name, file_url=None):
+  """先从 Storage 下载，失败则用公开 URL"""
+  if stored_name:
+      try:
+          return get_supabase().storage.from_("documents").download(stored_name)
+      except Exception:
+          pass
+  if file_url:
+      try:
+          r = requests.get(file_url, timeout=15)
+          if r.status_code == 200:
+              return r.content
+      except Exception:
+          pass
+  return None
 
 # ══════════════════════════════════════════
-# 数据库：洞察
+# 洞察操作
 # ══════════════════════════════════════════
 
 def save_insight(data):
-  sb     = get_supabase()
-  result = sb.table("insights").insert(data).execute()
+  result = get_supabase().table("insights").insert(data).execute()
   return result.data[0]["id"] if result.data else None
 
 def get_insights(insight_type=None, keyword=None, industry=None):
@@ -118,7 +121,7 @@ def delete_insight(iid):
   sb.table("insights").delete().eq("id", iid).execute()
 
 # ══════════════════════════════════════════
-# 数据库：佐证
+# 佐证操作
 # ══════════════════════════════════════════
 
 def save_support(insight_id, document_id=None, support_text="", source_name=""):
@@ -130,17 +133,26 @@ def save_support(insight_id, document_id=None, support_text="", source_name=""):
   }).execute()
 
 def get_supports(insight_id):
+  """分两步查询，避免联表报错"""
   sb     = get_supabase()
-  result = sb.table("insight_supports").select(
-      "*, documents(original_name, stored_name, file_url)"
-  ).eq("insight_id", insight_id).execute()
+  result = sb.table("insight_supports").select("*").eq(
+      "insight_id", insight_id
+  ).execute()
 
   supports = []
   for row in (result.data or []):
-      doc_info = row.pop("documents", None) or {}
-      row["original_name"] = doc_info.get("original_name")
-      row["stored_name"]   = doc_info.get("stored_name")
-      row["file_url"]      = doc_info.get("file_url")
+      row["original_name"] = None
+      row["stored_name"]   = None
+      row["file_url"]      = None
+      if row.get("document_id"):
+          doc_res = sb.table("documents").select(
+              "original_name, stored_name, file_url"
+          ).eq("id", row["document_id"]).execute()
+          if doc_res.data:
+              d = doc_res.data[0]
+              row["original_name"] = d.get("original_name")
+              row["stored_name"]   = d.get("stored_name")
+              row["file_url"]      = d.get("file_url")
       supports.append(row)
   return supports
 
@@ -148,12 +160,12 @@ def delete_support(sid):
   get_supabase().table("insight_supports").delete().eq("id", sid).execute()
 
 def get_stats():
-  sb       = get_supabase()
-  all_ins  = sb.table("insights").select("insight_type").execute().data or []
-  era      = sum(1 for i in all_ins if i["insight_type"] == "era")
-  audience = sum(1 for i in all_ins if i["insight_type"] == "audience")
-  docs     = len(sb.table("documents").select("id").execute().data or [])
-  return {"total": len(all_ins), "era": era, "audience": audience, "docs": docs}
+  sb      = get_supabase()
+  all_ins = sb.table("insights").select("insight_type").execute().data or []
+  era     = sum(1 for i in all_ins if i["insight_type"] == "era")
+  aud     = sum(1 for i in all_ins if i["insight_type"] == "audience")
+  docs    = len(sb.table("documents").select("id").execute().data or [])
+  return {"total": len(all_ins), "era": era, "audience": aud, "docs": docs}
 
 # ══════════════════════════════════════════
 # 文件解析
@@ -232,15 +244,17 @@ def render_supports(insight_id):
           c1, c2 = st.columns([10, 1])
           with c1:
               if sup.get("original_name"):
-                  if sup.get("stored_name"):
-                      fb = get_file_bytes(sup["stored_name"])
-                      if fb:
-                          st.download_button(
-                              f"📄 {sup['original_name']}",
-                              data=fb,
-                              file_name=sup["original_name"],
-                              key=f"dl_sup_{sup['id']}"
-                          )
+                  fb = get_file_bytes(
+                      sup.get("stored_name"),
+                      sup.get("file_url")
+                  )
+                  if fb:
+                      st.download_button(
+                          f"📄 {sup['original_name']}",
+                          data=fb,
+                          file_name=sup["original_name"],
+                          key=f"dl_sup_{sup['id']}"
+                      )
                   elif sup.get("file_url"):
                       st.markdown(f"[📄 {sup['original_name']}]({sup['file_url']})")
               if sup.get("support_text"):
@@ -292,14 +306,17 @@ def render_insight_form(form_key, doc_id=None):
           year = st.number_input("年份", min_value=2000, max_value=2035,
                                  value=datetime.now().year)
       title    = st.text_input("洞察标题 *", placeholder="一句话，要有张力")
-      content  = st.text_area("洞察描述 *", height=100, placeholder="展开说明，2-3句话...")
-      evidence = st.text_area("支撑依据", height=70, placeholder="数据、研究、现象（没有可不填）")
+      content  = st.text_area("洞察描述 *", height=100,
+                              placeholder="展开说明，2-3句话...")
+      evidence = st.text_area("支撑依据", height=70,
+                              placeholder="数据、研究、现象（没有可不填）")
       c3, c4 = st.columns(2)
       with c3:
           source   = st.text_input("来源 / 品牌", placeholder="例：某品牌提案")
       with c4:
           industry = st.text_input("所属行业",    placeholder="例：美妆 / 快消")
-      tags_input = st.text_input("标签（逗号分隔）", placeholder="例：Z世代, 情绪消费")
+      tags_input = st.text_input("标签（逗号分隔）",
+                                 placeholder="例：Z世代, 情绪消费")
       st.divider()
       if itype == "audience":
           st.markdown("**👥 人群维度**")
@@ -320,9 +337,11 @@ def render_insight_form(form_key, doc_id=None):
           st.markdown("**🌐 时代维度**")
           c5, c6 = st.columns(2)
           with c5:
-              macro_trend    = st.text_input("宏观趋势", placeholder="例：情绪消费")
+              macro_trend    = st.text_input("宏观趋势",
+                                             placeholder="例：情绪消费")
           with c6:
-              cultural_shift = st.text_input("文化转变", placeholder="例：从炫耀转向悦己")
+              cultural_shift = st.text_input("文化转变",
+                                             placeholder="例：从炫耀转向悦己")
           age_group = gender = city_tier = lifestyle = ""
 
       submitted = st.form_submit_button("💾 保存这条洞察", type="primary",
@@ -378,14 +397,19 @@ def render_insight_card(ins):
           st.divider()
           if ins.get("document_id"):
               doc = get_document(ins["document_id"])
-              if doc and doc.get("stored_name"):
-                  fb = get_file_bytes(doc["stored_name"])
+              if doc:
+                  fb = get_file_bytes(
+                      doc.get("stored_name"),
+                      doc.get("file_url")
+                  )
                   if fb:
                       st.download_button(
                           f"📄 来源文件：{doc['original_name']}",
                           data=fb, file_name=doc["original_name"],
                           key=f"dl_{ins['id']}"
                       )
+                  elif doc.get("file_url"):
+                      st.markdown(f"[📄 来源文件：{doc['original_name']}]({doc['file_url']})")
           st.caption(
               f"来源：{ins.get('source') or '未标注'} ｜ "
               f"行业：{ins.get('industry') or '未标注'} ｜ "
@@ -424,14 +448,19 @@ def page_home():
               st.write(ins["content"])
               if ins.get("document_id"):
                   doc = get_document(ins["document_id"])
-                  if doc and doc.get("stored_name"):
-                      fb = get_file_bytes(doc["stored_name"])
+                  if doc:
+                      fb = get_file_bytes(
+                          doc.get("stored_name"),
+                          doc.get("file_url")
+                      )
                       if fb:
                           st.download_button(
                               f"📄 来源文件：{doc['original_name']}",
                               data=fb, file_name=doc["original_name"],
                               key=f"hdl_{ins['id']}"
                           )
+                      elif doc.get("file_url"):
+                          st.markdown(f"[📄 {doc['original_name']}]({doc['file_url']})")
               st.caption(
                   f"来源：{ins.get('source') or '未标注'} ｜ "
                   f"{str(ins.get('created_at',''))[:10]}"
@@ -447,8 +476,8 @@ def page_manual():
 
   if "last_manual_iid" in st.session_state:
       iid  = st.session_state["last_manual_iid"]
-      sb   = get_supabase()
-      rows = sb.table("insights").select("title").eq("id", iid).execute().data
+      rows = get_supabase().table("insights").select("title").eq(
+          "id", iid).execute().data
       if rows:
           st.success(f"✅ 洞察「{rows[0]['title']}」已保存！")
           st.subheader("📎 为这条洞察上传佐证文件（可选）")
@@ -550,18 +579,20 @@ def page_docs():
               ca.metric("来源",     doc.get("source")   or "未标注")
               cb.metric("行业",     doc.get("industry") or "未标注")
               cc.metric("上传时间", str(doc.get("created_at",""))[:10])
-              sb    = get_supabase()
-              count = len(sb.table("insights").select("id").eq(
+              count = len(get_supabase().table("insights").select("id").eq(
                   "document_id", doc["id"]).execute().data or [])
               st.caption(f"🔗 已关联 **{count}** 条洞察")
-              if doc.get("stored_name"):
-                  fb = get_file_bytes(doc["stored_name"])
-                  if fb:
-                      st.download_button(
-                          "📥 下载原文件", data=fb,
-                          file_name=doc["original_name"],
-                          key=f"doc_dl_{doc['id']}"
-                      )
+              fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
+              if fb:
+                  st.download_button(
+                      "📥 下载原文件", data=fb,
+                      file_name=doc["original_name"],
+                      key=f"doc_dl_{doc['id']}"
+                  )
+              elif doc.get("file_url"):
+                  st.markdown(f"[📥 查看原文件]({doc['file_url']})")
+              else:
+                  st.warning("⚠️ 文件暂时无法下载")
       with col_del:
           if st.button("🗑️", key=f"doc_del_{doc['id']}", help="删除此文档"):
               delete_document(doc["id"])
@@ -604,7 +635,7 @@ def page_ai_import():
 
   st.divider()
   tab1, tab2 = st.tabs(["📁 上传文件", "📋 粘贴文字"])
-  text = ""
+  text      = ""
   file_info = None
 
   with tab1:
