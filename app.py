@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-#   洞察整理大师 app.py 稳定版
+#   洞察整理大师 app.py（含网页抓取功能）
 # ════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -7,6 +7,7 @@ import os
 import io
 import json
 import time
+import requests
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -36,18 +37,14 @@ def get_supabase():
 # ══════════════════════════════════════════
 
 def save_document(file_bytes, original_name, source, industry, year):
-  """保存文件到 Storage，失败也不影响洞察保存"""
   sb          = get_supabase()
   stored_name = f"{int(time.time())}_{original_name}"
   file_url    = ""
-
-  # 文件上传失败不报错，只是没有下载功能
   try:
       sb.storage.from_("documents").upload(stored_name, file_bytes)
       file_url = sb.storage.from_("documents").get_public_url(stored_name)
   except Exception:
       stored_name = ""
-
   result = sb.table("documents").insert({
       "original_name": original_name,
       "stored_name":   stored_name,
@@ -88,7 +85,6 @@ def get_file_bytes(stored_name, file_url=None):
           pass
   if file_url:
       try:
-          import requests
           r = requests.get(file_url, timeout=15)
           if r.status_code == 200:
               return r.content
@@ -190,6 +186,90 @@ def parse_txt(b):
   return b.decode("utf-8", errors="ignore")
 
 # ══════════════════════════════════════════
+# 网页抓取
+# ══════════════════════════════════════════
+
+def fetch_url_content(url: str) -> tuple:
+  """
+  从网页 URL 抓取正文内容
+  返回：(正文内容, 页面标题)
+  支持：微信公众号、知乎、36氪、虎嗅、各类新闻资讯网站
+  """
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/120.0.0.0 Safari/537.36"
+      ),
+      "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Accept-Encoding": "gzip, deflate",
+      "Connection":      "keep-alive",
+  }
+
+  resp = requests.get(url, headers=headers, timeout=20)
+  resp.encoding = resp.apparent_encoding
+
+  from bs4 import BeautifulSoup
+  soup = BeautifulSoup(resp.text, "html.parser")
+
+  # 获取页面标题
+  title = ""
+  if soup.title:
+      title = soup.title.string.strip() if soup.title.string else ""
+  if not title:
+      og_title = soup.find("meta", property="og:title")
+      title = og_title.get("content", url) if og_title else url
+
+  # 移除无用标签
+  for tag in soup(["script", "style", "nav", "footer",
+                   "header", "aside", "iframe", "img",
+                   "button", "form", "advertisement"]):
+      tag.decompose()
+
+  # 按优先级提取正文（针对常见中文网站优化）
+  content = ""
+  selectors = [
+      # 微信公众号
+      "#js_content",
+      ".rich_media_content",
+      # 知乎
+      ".Post-RichText",
+      ".RichText",
+      # 36氪/虎嗅等资讯网站
+      ".article-content",
+      ".article-body",
+      ".post-content",
+      "[class*='article']",
+      "[class*='content']",
+      "[class*='post-body']",
+      # 通用
+      "article",
+      "main",
+      "#content",
+      ".content",
+  ]
+
+  for selector in selectors:
+      element = soup.select_one(selector)
+      if element:
+          candidate = element.get_text(separator="\n", strip=True)
+          if len(candidate) > 300:
+              content = candidate
+              break
+
+  # 如果都没找到，取 body
+  if not content:
+      body = soup.find("body")
+      content = body.get_text(separator="\n", strip=True) if body else ""
+
+  # 清理：去掉空行和太短的行
+  lines      = [line.strip() for line in content.split("\n") if len(line.strip()) > 5]
+  clean_text = "\n".join(lines)
+
+  return clean_text, title
+
+# ══════════════════════════════════════════
 # AI 提取
 # ══════════════════════════════════════════
 
@@ -283,9 +363,7 @@ def render_supports(insight_id):
           c1, c2 = st.columns([10, 1])
           with c1:
               if sup.get("original_name"):
-                  fb = get_file_bytes(
-                      sup.get("stored_name"), sup.get("file_url")
-                  )
+                  fb = get_file_bytes(sup.get("stored_name"), sup.get("file_url"))
                   if fb:
                       st.download_button(
                           f"📄 {sup['original_name']}",
@@ -618,19 +696,19 @@ def page_docs():
               elif doc.get("file_url"):
                   st.markdown(f"[📥 查看原文件]({doc['file_url']})")
               else:
-                  st.caption("📄 文件记录已保存（无下载功能）")
+                  st.caption("📄 文件记录已保存")
       with col_del:
           if st.button("🗑️", key=f"doc_del_{doc['id']}", help="删除此文档"):
               delete_document(doc["id"])
               st.rerun()
 
 # ══════════════════════════════════════════
-# 页面：AI 导入（洞察和文件独立保存）
+# 页面：AI 导入（含网页抓取）
 # ══════════════════════════════════════════
 
 def page_ai_import():
   st.title("🤖 AI 智能导入")
-  st.caption("上传策略文档，AI 自动提取洞察，可手动补充遗漏部分")
+  st.caption("支持上传文件 · 粘贴文字 · 直接输入网页链接")
 
   if not get_secret("DEEPSEEK_API_KEY"):
       st.error("⚠️ 未找到 API Key")
@@ -645,9 +723,11 @@ def page_ai_import():
           st.success("✅ 补充洞察已保存！")
           st.rerun()
       st.divider()
-      if st.button("🔄 导入新文档", use_container_width=True):
+      if st.button("🔄 导入新内容", use_container_width=True):
           st.session_state.pop("ai_import_done", None)
           st.session_state.pop("ai_saved_doc_id", None)
+          st.session_state.pop("fetched_text",    None)
+          st.session_state.pop("fetched_title",   None)
           st.rerun()
       return
 
@@ -659,10 +739,13 @@ def page_ai_import():
       industry = st.text_input("所属行业", placeholder="例：运动 / 快消 / 科技")
 
   st.divider()
-  tab1, tab2 = st.tabs(["📁 上传文件", "📋 粘贴文字"])
+
+  # ── 三个输入 Tab ──────────────────────────
+  tab1, tab2, tab3 = st.tabs(["📁 上传文件", "📋 粘贴文字", "🔗 网页链接"])
   text      = ""
   file_info = None
 
+  # Tab1：上传文件
   with tab1:
       st.caption("支持 Word (.docx) · PDF (.pdf) · 纯文本 (.txt)")
       up = st.file_uploader("选择文件", type=["docx","pdf","txt"],
@@ -681,13 +764,63 @@ def page_ai_import():
               except Exception as e:
                   st.error(f"文件读取失败：{e}")
 
+  # Tab2：粘贴文字
   with tab2:
-      pasted = st.text_area("粘贴文字内容", height=250,
-                            placeholder="把提案中洞察部分粘贴进来...")
+      pasted = st.text_area(
+          "粘贴文字内容", height=250,
+          placeholder="把提案、文章、社交媒体帖子内容粘贴进来..."
+      )
       if pasted:
           text = pasted
 
+  # Tab3：网页链接（新功能）
+  with tab3:
+      st.caption("支持：微信公众号 · 知乎 · 36氪 · 虎嗅 · 各类新闻资讯网站")
+
+      url_input = st.text_input(
+          "输入网页链接",
+          placeholder="https://mp.weixin.qq.com/s/xxxxx",
+          label_visibility="collapsed"
+      )
+
+      if url_input:
+          if st.button("📥 抓取网页内容", key="fetch_url", type="primary"):
+              with st.spinner("正在抓取网页内容，请稍候..."):
+                  try:
+                      fetched_text, page_title = fetch_url_content(url_input)
+                      if len(fetched_text) < 100:
+                          st.warning("抓取到的内容太少，该网站可能有反爬限制，建议手动复制内容到「📋 粘贴文字」")
+                      else:
+                          st.session_state["fetched_text"]  = fetched_text
+                          st.session_state["fetched_title"] = page_title
+                          st.session_state["fetched_url"]   = url_input
+                          st.success(
+                              f"✅ 抓取成功：{page_title[:40]}（共 {len(fetched_text)} 字）"
+                          )
+                  except Exception as e:
+                      st.error(f"抓取失败：{e}")
+                      st.caption("💡 建议：手动复制网页内容，粘贴到「📋 粘贴文字」Tab")
+
+      # 显示已抓取的内容
+      if st.session_state.get("fetched_text"):
+          fetched = st.session_state["fetched_text"]
+          text    = fetched
+
+          with st.expander("📄 已抓取内容预览"):
+              st.text(fetched[:800] + "..." if len(fetched) > 800 else fetched)
+
+          # 提示自动填入来源
+          if st.session_state.get("fetched_title") and not source:
+              st.info(f"💡 建议「文档来源」填写：{st.session_state['fetched_title'][:30]}")
+
+          if st.button("🗑️ 清除已抓取内容", key="clear_fetch"):
+              st.session_state.pop("fetched_text",  None)
+              st.session_state.pop("fetched_title", None)
+              st.session_state.pop("fetched_url",   None)
+              st.rerun()
+
   st.divider()
+
   if not source:
       st.warning("⬆️ 请先填写「文档来源 / 品牌」")
 
@@ -730,9 +863,9 @@ def page_ai_import():
           if st.button(f"💾 保存选中的 {len(selected)} 条", type="primary",
                        disabled=len(selected) == 0, use_container_width=True):
 
-              # ① 先尝试保存文件（失败不影响洞察）
+              # 先尝试保存文件（失败不影响洞察）
               doc_id = None
-              fi = st.session_state.get("ai_file_info")
+              fi     = st.session_state.get("ai_file_info")
               if fi:
                   try:
                       doc_id = save_document(
@@ -742,9 +875,9 @@ def page_ai_import():
                           datetime.now().year
                       )
                   except Exception:
-                      pass  # 文件保存失败，洞察仍继续保存
+                      pass
 
-              # ② 保存洞察（核心，必须成功）
+              # 保存洞察（核心）
               saved_count = 0
               for ins in selected:
                   try:
