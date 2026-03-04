@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-#   洞察整理大师 app.py 云端修复版
+#   洞察整理大师 app.py 最终完整版
 # ════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -77,7 +77,6 @@ def delete_document(doc_id):
   sb.table("insights").update({"document_id": None}).eq("document_id", doc_id).execute()
 
 def get_file_bytes(stored_name, file_url=None):
-  """先从 Storage 下载，失败则用公开 URL"""
   if stored_name:
       try:
           return get_supabase().storage.from_("documents").download(stored_name)
@@ -133,12 +132,10 @@ def save_support(insight_id, document_id=None, support_text="", source_name=""):
   }).execute()
 
 def get_supports(insight_id):
-  """分两步查询，避免联表报错"""
   sb     = get_supabase()
   result = sb.table("insight_supports").select("*").eq(
       "insight_id", insight_id
   ).execute()
-
   supports = []
   for row in (result.data or []):
       row["original_name"] = None
@@ -188,7 +185,7 @@ def parse_txt(b):
   return b.decode("utf-8", errors="ignore")
 
 # ══════════════════════════════════════════
-# AI 提取
+# AI 提取（升级版：分段处理 + 专业提示词）
 # ══════════════════════════════════════════
 
 def ai_extract_insights(text):
@@ -196,12 +193,53 @@ def ai_extract_insights(text):
       api_key=get_secret("DEEPSEEK_API_KEY"),
       base_url="https://api.deepseek.com"
   )
-  prompt = f"""
-你是一位资深广告策略师。请从以下策略文档中，提取所有有价值的时代洞察和人群洞察。
 
-文档内容：
+  # 长文档分段，每段 6000 字，最多处理 3 段（共 18000 字）
+  chunk_size   = 6000
+  chunks       = []
+  for i in range(0, min(len(text), 18000), chunk_size):
+      chunk = text[i:i + chunk_size].strip()
+      if len(chunk) > 200:
+          chunks.append(chunk)
+
+  all_insights = []
+
+  for idx, chunk in enumerate(chunks):
+      prompt = f"""
+你是一位拥有20年经验的顶级广告策略师，专门研究消费者洞察和时代趋势。
+
+请从以下文档片段中，深度提取有价值的【时代洞察】和【人群洞察】。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【什么是好洞察？】
+
+时代洞察（era）：
+- 反映当下社会情绪、价值观转变、消费文化变化
+- 是一个时代共同感受到的集体情绪或趋势
+
+人群洞察（audience）：
+- 反映特定人群内心深处的需求、行为逻辑、消费心理
+- 是这群人自己说不清但深有共鸣的内心状态
+
+【好洞察 vs 坏洞察 举例】
+✅ 好：「年轻人用消费对抗不确定性——买一杯贵的咖啡，是在混乱时代里确认自我存在」
+❌ 坏：「年轻人消费能力强，喜欢买咖啡」
+
+✅ 好：「她们不是在买护肤品，是在买一套每天属于自己的仪式感」
+❌ 坏：「女性消费者重视护肤，购买频次高」
+
+✅ 好：「反内卷不是躺平，而是一种更聪明的能量分配——把力气花在值得的地方」
+❌ 坏：「年轻人工作压力大，开始注重生活平衡」
+
+【不要提取的内容】
+- 纯数据统计（如「用户增长30%」）
+- 行业现状描述（如「市场规模达XX亿」）
+- 政策法规说明
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+文档内容（第{idx + 1}段，共{len(chunks)}段）：
 ---
-{text[:4000]}
+{chunk}
 ---
 
 请以JSON格式返回：
@@ -209,28 +247,37 @@ def ai_extract_insights(text):
 "insights": [
   {{
     "insight_type": "era 或 audience",
-    "title": "洞察标题，一句话，15字以内，要有穿透力",
-    "content": "洞察详细描述，2-3句话",
-    "evidence": "支撑依据（如有）",
-    "tags": ["标签1", "标签2", "标签3"],
-    "age_group": "年龄群（仅人群洞察填）",
+    "title": "洞察标题，20字以内，要让人产生强烈共鸣",
+    "content": "洞察深度描述，2-4句话，说清楚背后的人性逻辑",
+    "evidence": "文档中支撑这个洞察的原文数据或现象",
+    "tags": ["关键词1", "关键词2", "关键词3"],
+    "age_group": "目标年龄群（仅人群洞察填）",
     "gender": "性别（仅人群洞察填）",
     "city_tier": "城市层级（仅人群洞察填）",
-    "lifestyle": "生活方式（仅人群洞察填）",
-    "macro_trend": "宏观趋势（仅时代洞察填）",
-    "cultural_shift": "文化转变（仅时代洞察填）"
+    "lifestyle": "生活方式特征（仅人群洞察填）",
+    "macro_trend": "宏观趋势关键词（仅时代洞察填）",
+    "cultural_shift": "文化转变方向（仅时代洞察填）"
   }}
 ]
 }}
-只返回JSON，不要其他文字。
+
+注意：宁缺毋滥，没有好洞察就返回空数组。只返回JSON。
 """
-  resp   = client.chat.completions.create(
-      model="deepseek-chat",
-      messages=[{"role": "user", "content": prompt}],
-      response_format={"type": "json_object"},
-      temperature=0.3
-  )
-  return json.loads(resp.choices[0].message.content).get("insights", [])
+      try:
+          resp = client.chat.completions.create(
+              model="deepseek-chat",
+              messages=[{"role": "user", "content": prompt}],
+              response_format={"type": "json_object"},
+              temperature=0.4
+          )
+          chunk_insights = json.loads(
+              resp.choices[0].message.content
+          ).get("insights", [])
+          all_insights.extend(chunk_insights)
+      except Exception as e:
+          st.warning(f"第{idx + 1}段提取出现问题：{e}")
+
+  return all_insights
 
 # ══════════════════════════════════════════
 # 组件：佐证
@@ -244,15 +291,11 @@ def render_supports(insight_id):
           c1, c2 = st.columns([10, 1])
           with c1:
               if sup.get("original_name"):
-                  fb = get_file_bytes(
-                      sup.get("stored_name"),
-                      sup.get("file_url")
-                  )
+                  fb = get_file_bytes(sup.get("stored_name"), sup.get("file_url"))
                   if fb:
                       st.download_button(
                           f"📄 {sup['original_name']}",
-                          data=fb,
-                          file_name=sup["original_name"],
+                          data=fb, file_name=sup["original_name"],
                           key=f"dl_sup_{sup['id']}"
                       )
                   elif sup.get("file_url"):
@@ -337,8 +380,7 @@ def render_insight_form(form_key, doc_id=None):
           st.markdown("**🌐 时代维度**")
           c5, c6 = st.columns(2)
           with c5:
-              macro_trend    = st.text_input("宏观趋势",
-                                             placeholder="例：情绪消费")
+              macro_trend    = st.text_input("宏观趋势", placeholder="例：情绪消费")
           with c6:
               cultural_shift = st.text_input("文化转变",
                                              placeholder="例：从炫耀转向悦己")
@@ -398,10 +440,7 @@ def render_insight_card(ins):
           if ins.get("document_id"):
               doc = get_document(ins["document_id"])
               if doc:
-                  fb = get_file_bytes(
-                      doc.get("stored_name"),
-                      doc.get("file_url")
-                  )
+                  fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
                   if fb:
                       st.download_button(
                           f"📄 来源文件：{doc['original_name']}",
@@ -409,7 +448,9 @@ def render_insight_card(ins):
                           key=f"dl_{ins['id']}"
                       )
                   elif doc.get("file_url"):
-                      st.markdown(f"[📄 来源文件：{doc['original_name']}]({doc['file_url']})")
+                      st.markdown(
+                          f"[📄 来源文件：{doc['original_name']}]({doc['file_url']})"
+                      )
           st.caption(
               f"来源：{ins.get('source') or '未标注'} ｜ "
               f"行业：{ins.get('industry') or '未标注'} ｜ "
@@ -449,10 +490,7 @@ def page_home():
               if ins.get("document_id"):
                   doc = get_document(ins["document_id"])
                   if doc:
-                      fb = get_file_bytes(
-                          doc.get("stored_name"),
-                          doc.get("file_url")
-                      )
+                      fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
                       if fb:
                           st.download_button(
                               f"📄 来源文件：{doc['original_name']}",
@@ -668,7 +706,7 @@ def page_ai_import():
 
   if st.button("🚀 开始 AI 提取洞察", type="primary",
                disabled=not (text and source), use_container_width=True):
-      with st.spinner("🤖 AI 正在分析，通常需要 10-30 秒..."):
+      with st.spinner("🤖 AI 正在分段分析，文档越长等待越久，请耐心等待..."):
           try:
               ins = ai_extract_insights(text)
               st.session_state["ai_results"]   = ins
