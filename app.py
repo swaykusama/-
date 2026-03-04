@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-#   洞察整理大师 app.py 最终稳定版（文件存数据库）
+#   洞察整理大师 app.py 稳定版
 # ════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -7,7 +7,6 @@ import os
 import io
 import json
 import time
-import base64
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -33,18 +32,26 @@ def get_supabase():
   )
 
 # ══════════════════════════════════════════
-# 文档操作（文件直接存数据库）
+# 文档操作
 # ══════════════════════════════════════════
 
 def save_document(file_bytes, original_name, source, industry, year):
-  """把文件编码成 base64 存进数据库，不依赖 Storage"""
-  sb           = get_supabase()
-  file_content = base64.b64encode(file_bytes).decode("utf-8")
+  """保存文件到 Storage，失败也不影响洞察保存"""
+  sb          = get_supabase()
+  stored_name = f"{int(time.time())}_{original_name}"
+  file_url    = ""
+
+  # 文件上传失败不报错，只是没有下载功能
+  try:
+      sb.storage.from_("documents").upload(stored_name, file_bytes)
+      file_url = sb.storage.from_("documents").get_public_url(stored_name)
+  except Exception:
+      stored_name = ""
+
   result = sb.table("documents").insert({
       "original_name": original_name,
-      "stored_name":   original_name,
-      "file_url":      "",
-      "file_content":  file_content,
+      "stored_name":   stored_name,
+      "file_url":      file_url,
       "source":        source,
       "industry":      industry,
       "year":          year
@@ -63,27 +70,31 @@ def get_all_documents():
   ).order("created_at", desc=True).execute().data or []
 
 def delete_document(doc_id):
-  sb = get_supabase()
+  sb  = get_supabase()
+  doc = get_document(doc_id)
+  if doc and doc.get("stored_name"):
+      try:
+          sb.storage.from_("documents").remove([doc["stored_name"]])
+      except Exception:
+          pass
   sb.table("documents").delete().eq("id", doc_id).execute()
   sb.table("insights").update({"document_id": None}).eq("document_id", doc_id).execute()
 
-def get_file_bytes(doc):
-  """从数据库 base64 解码文件内容"""
-  if not doc:
-      return None
-  if doc.get("file_content"):
+def get_file_bytes(stored_name, file_url=None):
+  if stored_name:
       try:
-          return base64.b64decode(doc["file_content"])
+          return get_supabase().storage.from_("documents").download(stored_name)
+      except Exception:
+          pass
+  if file_url:
+      try:
+          import requests
+          r = requests.get(file_url, timeout=15)
+          if r.status_code == 200:
+              return r.content
       except Exception:
           pass
   return None
-
-def get_document_with_content(doc_id):
-  """获取包含文件内容的完整文档"""
-  if not doc_id:
-      return None
-  result = get_supabase().table("documents").select("*").eq("id", doc_id).execute()
-  return result.data[0] if result.data else None
 
 # ══════════════════════════════════════════
 # 洞察操作
@@ -133,15 +144,17 @@ def get_supports(insight_id):
   supports = []
   for row in (result.data or []):
       row["original_name"] = None
-      row["file_content"]  = None
+      row["stored_name"]   = None
+      row["file_url"]      = None
       if row.get("document_id"):
           doc_res = sb.table("documents").select(
-              "original_name, file_content"
+              "original_name, stored_name, file_url"
           ).eq("id", row["document_id"]).execute()
           if doc_res.data:
               d = doc_res.data[0]
               row["original_name"] = d.get("original_name")
-              row["file_content"]  = d.get("file_content")
+              row["stored_name"]   = d.get("stored_name")
+              row["file_url"]      = d.get("file_url")
       supports.append(row)
   return supports
 
@@ -177,7 +190,7 @@ def parse_txt(b):
   return b.decode("utf-8", errors="ignore")
 
 # ══════════════════════════════════════════
-# AI 提取（分段 + 专业提示词）
+# AI 提取
 # ══════════════════════════════════════════
 
 def ai_extract_insights(text):
@@ -186,8 +199,8 @@ def ai_extract_insights(text):
       base_url="https://api.deepseek.com"
   )
 
-  chunk_size   = 6000
-  chunks       = []
+  chunk_size = 6000
+  chunks     = []
   for i in range(0, min(len(text), 18000), chunk_size):
       chunk = text[i:i + chunk_size].strip()
       if len(chunk) > 200:
@@ -204,13 +217,8 @@ def ai_extract_insights(text):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【什么是好洞察？】
 
-时代洞察（era）：
-- 反映当下社会情绪、价值观转变、消费文化变化
-- 是一个时代共同感受到的集体情绪或趋势
-
-人群洞察（audience）：
-- 反映特定人群内心深处的需求、行为逻辑、消费心理
-- 是这群人自己说不清但深有共鸣的内心状态
+时代洞察（era）：反映当下社会情绪、价值观转变、消费文化变化
+人群洞察（audience）：反映特定人群内心深处的需求、行为逻辑、消费心理
 
 【好洞察 vs 坏洞察 举例】
 ✅ 好：「年轻人用消费对抗不确定性——买一杯贵的咖啡，是在混乱时代里确认自我存在」
@@ -219,13 +227,7 @@ def ai_extract_insights(text):
 ✅ 好：「她们不是在买护肤品，是在买一套每天属于自己的仪式感」
 ❌ 坏：「女性消费者重视护肤，购买频次高」
 
-✅ 好：「反内卷不是躺平，而是一种更聪明的能量分配——把力气花在值得的地方」
-❌ 坏：「年轻人工作压力大，开始注重生活平衡」
-
-【不要提取的内容】
-- 纯数据统计（如「用户增长30%」）
-- 行业现状描述（如「市场规模达XX亿」）
-- 政策法规说明
+【不要提取】纯数据统计、行业现状描述、政策法规
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 文档内容（第{idx + 1}段，共{len(chunks)}段）：
@@ -251,8 +253,7 @@ def ai_extract_insights(text):
   }}
 ]
 }}
-
-注意：宁缺毋滥，没有好洞察就返回空数组。只返回JSON。
+宁缺毋滥，没有好洞察就返回空数组。只返回JSON。
 """
       try:
           resp = client.chat.completions.create(
@@ -282,14 +283,17 @@ def render_supports(insight_id):
           c1, c2 = st.columns([10, 1])
           with c1:
               if sup.get("original_name"):
-                  fb = get_file_bytes(sup)
+                  fb = get_file_bytes(
+                      sup.get("stored_name"), sup.get("file_url")
+                  )
                   if fb:
                       st.download_button(
                           f"📄 {sup['original_name']}",
-                          data=fb,
-                          file_name=sup["original_name"],
+                          data=fb, file_name=sup["original_name"],
                           key=f"dl_sup_{sup['id']}"
                       )
+                  elif sup.get("file_url"):
+                      st.markdown(f"[📄 {sup['original_name']}]({sup['file_url']})")
                   else:
                       st.caption(f"📄 {sup['original_name']}")
               if sup.get("support_text"):
@@ -312,9 +316,10 @@ def render_supports(insight_id):
                               placeholder="例：尼尔森2024报告")
           if st.button("保存文件佐证", key=f"savesf_{insight_id}") and sf:
               did = save_document(sf.read(), sf.name, src, "", datetime.now().year)
-              save_support(insight_id, document_id=did, source_name=src)
-              st.success("✅ 已保存！")
-              st.rerun()
+              if did:
+                  save_support(insight_id, document_id=did, source_name=src)
+                  st.success("✅ 已保存！")
+                  st.rerun()
       with tt:
           stxt = st.text_area("文字佐证", key=f"stxt_{insight_id}",
                               placeholder="例：QuestMobile数据显示...")
@@ -430,15 +435,21 @@ def render_insight_card(ins):
                   pass
           st.divider()
           if ins.get("document_id"):
-              doc = get_document_with_content(ins["document_id"])
+              doc = get_document(ins["document_id"])
               if doc:
-                  fb = get_file_bytes(doc)
+                  fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
                   if fb:
                       st.download_button(
                           f"📄 来源文件：{doc['original_name']}",
                           data=fb, file_name=doc["original_name"],
                           key=f"dl_{ins['id']}"
                       )
+                  elif doc.get("file_url"):
+                      st.markdown(
+                          f"[📄 来源文件：{doc['original_name']}]({doc['file_url']})"
+                      )
+                  else:
+                      st.caption(f"📄 来源：{doc['original_name']}")
           st.caption(
               f"来源：{ins.get('source') or '未标注'} ｜ "
               f"行业：{ins.get('industry') or '未标注'} ｜ "
@@ -573,10 +584,11 @@ def page_docs():
       new_file = st.file_uploader("选择文件", type=["docx","pdf","txt"],
                                   key="new_doc_file")
       if st.button("📤 上传保存", type="primary") and new_file:
-          save_document(new_file.read(), new_file.name,
-                        new_src, new_ind, datetime.now().year)
-          st.success(f"✅ 已上传：{new_file.name}")
-          st.rerun()
+          did = save_document(new_file.read(), new_file.name,
+                              new_src, new_ind, datetime.now().year)
+          if did:
+              st.success(f"✅ 已上传：{new_file.name}")
+              st.rerun()
 
   st.divider()
   docs = get_all_documents()
@@ -596,24 +608,24 @@ def page_docs():
               count = len(get_supabase().table("insights").select("id").eq(
                   "document_id", doc["id"]).execute().data or [])
               st.caption(f"🔗 已关联 **{count}** 条洞察")
-              # 下载需要完整文档（含 file_content）
-              full_doc = get_document_with_content(doc["id"])
-              fb = get_file_bytes(full_doc)
+              fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
               if fb:
                   st.download_button(
                       "📥 下载原文件", data=fb,
                       file_name=doc["original_name"],
                       key=f"doc_dl_{doc['id']}"
                   )
+              elif doc.get("file_url"):
+                  st.markdown(f"[📥 查看原文件]({doc['file_url']})")
               else:
-                  st.warning("⚠️ 文件暂时无法下载")
+                  st.caption("📄 文件记录已保存（无下载功能）")
       with col_del:
           if st.button("🗑️", key=f"doc_del_{doc['id']}", help="删除此文档"):
               delete_document(doc["id"])
               st.rerun()
 
 # ══════════════════════════════════════════
-# 页面：AI 导入
+# 页面：AI 导入（洞察和文件独立保存）
 # ══════════════════════════════════════════
 
 def page_ai_import():
@@ -628,7 +640,6 @@ def page_ai_import():
       doc_id = st.session_state.get("ai_saved_doc_id")
       st.success("✅ AI 洞察已保存！如有遗漏，可在下方手动补充")
       st.subheader("✏️ AI 有遗漏？手动补充一条")
-      st.caption("补充的洞察会自动关联同一份原始文档")
       submitted, iid = render_insight_form("ai_supplement_form", doc_id=doc_id)
       if submitted and iid:
           st.success("✅ 补充洞察已保存！")
@@ -682,7 +693,7 @@ def page_ai_import():
 
   if st.button("🚀 开始 AI 提取洞察", type="primary",
                disabled=not (text and source), use_container_width=True):
-      with st.spinner("🤖 AI 正在分段分析，文档越长等待越久，请耐心..."):
+      with st.spinner("🤖 AI 正在分段分析，请耐心等待..."):
           try:
               ins = ai_extract_insights(text)
               st.session_state["ai_results"]   = ins
@@ -718,39 +729,54 @@ def page_ai_import():
       with cs:
           if st.button(f"💾 保存选中的 {len(selected)} 条", type="primary",
                        disabled=len(selected) == 0, use_container_width=True):
+
+              # ① 先尝试保存文件（失败不影响洞察）
               doc_id = None
               fi = st.session_state.get("ai_file_info")
               if fi:
-                  doc_id = save_document(
-                      fi["bytes"], fi["name"],
-                      st.session_state["ai_source"],
-                      st.session_state["ai_industry"],
-                      datetime.now().year
-                  )
+                  try:
+                      doc_id = save_document(
+                          fi["bytes"], fi["name"],
+                          st.session_state["ai_source"],
+                          st.session_state["ai_industry"],
+                          datetime.now().year
+                      )
+                  except Exception:
+                      pass  # 文件保存失败，洞察仍继续保存
+
+              # ② 保存洞察（核心，必须成功）
+              saved_count = 0
               for ins in selected:
-                  save_insight({
-                      "insight_type": ins["insight_type"],
-                      "title":        ins["title"],
-                      "content":      ins["content"],
-                      "evidence":     ins.get("evidence", ""),
-                      "source":       st.session_state["ai_source"],
-                      "industry":     st.session_state["ai_industry"],
-                      "year":         datetime.now().year,
-                      "tags":         json.dumps(ins.get("tags",[]),
-                                                 ensure_ascii=False),
-                      "age_group":    ins.get("age_group",""),
-                      "gender":       ins.get("gender",""),
-                      "city_tier":    ins.get("city_tier",""),
-                      "lifestyle":    ins.get("lifestyle",""),
-                      "macro_trend":  ins.get("macro_trend",""),
-                      "cultural_shift": ins.get("cultural_shift",""),
-                      "document_id":  doc_id
-                  })
+                  try:
+                      save_insight({
+                          "insight_type": ins["insight_type"],
+                          "title":        ins["title"],
+                          "content":      ins["content"],
+                          "evidence":     ins.get("evidence", ""),
+                          "source":       st.session_state["ai_source"],
+                          "industry":     st.session_state["ai_industry"],
+                          "year":         datetime.now().year,
+                          "tags":         json.dumps(ins.get("tags",[]),
+                                                     ensure_ascii=False),
+                          "age_group":    ins.get("age_group",""),
+                          "gender":       ins.get("gender",""),
+                          "city_tier":    ins.get("city_tier",""),
+                          "lifestyle":    ins.get("lifestyle",""),
+                          "macro_trend":  ins.get("macro_trend",""),
+                          "cultural_shift": ins.get("cultural_shift",""),
+                          "document_id":  doc_id
+                      })
+                      saved_count += 1
+                  except Exception as e:
+                      st.error(f"保存洞察失败：{e}")
+
               del st.session_state["ai_results"]
               st.session_state.pop("ai_file_info", None)
               st.session_state["ai_import_done"]  = True
               st.session_state["ai_saved_doc_id"] = doc_id
+              st.success(f"✅ 已保存 {saved_count} 条洞察！")
               st.rerun()
+
       with cc2:
           if st.button("✖️ 重新来", use_container_width=True):
               del st.session_state["ai_results"]
