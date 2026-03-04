@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════
-#   洞察整理大师 app.py 最终完整版
+#   洞察整理大师 app.py 最终稳定版（文件存数据库）
 # ════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -7,7 +7,7 @@ import os
 import io
 import json
 import time
-import requests
+import base64
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -33,22 +33,18 @@ def get_supabase():
   )
 
 # ══════════════════════════════════════════
-# 文档操作
+# 文档操作（文件直接存数据库）
 # ══════════════════════════════════════════
 
 def save_document(file_bytes, original_name, source, industry, year):
-  sb          = get_supabase()
-  stored_name = f"{int(time.time())}_{original_name}"
-  file_url    = ""
-  try:
-      sb.storage.from_("documents").upload(stored_name, file_bytes)
-      file_url = sb.storage.from_("documents").get_public_url(stored_name)
-  except Exception as e:
-      st.warning(f"文件上传失败：{e}")
+  """把文件编码成 base64 存进数据库，不依赖 Storage"""
+  sb           = get_supabase()
+  file_content = base64.b64encode(file_bytes).decode("utf-8")
   result = sb.table("documents").insert({
       "original_name": original_name,
-      "stored_name":   stored_name,
-      "file_url":      file_url,
+      "stored_name":   original_name,
+      "file_url":      "",
+      "file_content":  file_content,
       "source":        source,
       "industry":      industry,
       "year":          year
@@ -62,34 +58,32 @@ def get_document(doc_id):
   return result.data[0] if result.data else None
 
 def get_all_documents():
-  return get_supabase().table("documents").select("*").order(
-      "created_at", desc=True).execute().data or []
+  return get_supabase().table("documents").select(
+      "id, original_name, stored_name, file_url, source, industry, year, created_at"
+  ).order("created_at", desc=True).execute().data or []
 
 def delete_document(doc_id):
-  sb  = get_supabase()
-  doc = get_document(doc_id)
-  if doc and doc.get("stored_name"):
-      try:
-          sb.storage.from_("documents").remove([doc["stored_name"]])
-      except Exception:
-          pass
+  sb = get_supabase()
   sb.table("documents").delete().eq("id", doc_id).execute()
   sb.table("insights").update({"document_id": None}).eq("document_id", doc_id).execute()
 
-def get_file_bytes(stored_name, file_url=None):
-  if stored_name:
+def get_file_bytes(doc):
+  """从数据库 base64 解码文件内容"""
+  if not doc:
+      return None
+  if doc.get("file_content"):
       try:
-          return get_supabase().storage.from_("documents").download(stored_name)
-      except Exception:
-          pass
-  if file_url:
-      try:
-          r = requests.get(file_url, timeout=15)
-          if r.status_code == 200:
-              return r.content
+          return base64.b64decode(doc["file_content"])
       except Exception:
           pass
   return None
+
+def get_document_with_content(doc_id):
+  """获取包含文件内容的完整文档"""
+  if not doc_id:
+      return None
+  result = get_supabase().table("documents").select("*").eq("id", doc_id).execute()
+  return result.data[0] if result.data else None
 
 # ══════════════════════════════════════════
 # 洞察操作
@@ -139,17 +133,15 @@ def get_supports(insight_id):
   supports = []
   for row in (result.data or []):
       row["original_name"] = None
-      row["stored_name"]   = None
-      row["file_url"]      = None
+      row["file_content"]  = None
       if row.get("document_id"):
           doc_res = sb.table("documents").select(
-              "original_name, stored_name, file_url"
+              "original_name, file_content"
           ).eq("id", row["document_id"]).execute()
           if doc_res.data:
               d = doc_res.data[0]
               row["original_name"] = d.get("original_name")
-              row["stored_name"]   = d.get("stored_name")
-              row["file_url"]      = d.get("file_url")
+              row["file_content"]  = d.get("file_content")
       supports.append(row)
   return supports
 
@@ -185,7 +177,7 @@ def parse_txt(b):
   return b.decode("utf-8", errors="ignore")
 
 # ══════════════════════════════════════════
-# AI 提取（升级版：分段处理 + 专业提示词）
+# AI 提取（分段 + 专业提示词）
 # ══════════════════════════════════════════
 
 def ai_extract_insights(text):
@@ -194,7 +186,6 @@ def ai_extract_insights(text):
       base_url="https://api.deepseek.com"
   )
 
-  # 长文档分段，每段 6000 字，最多处理 3 段（共 18000 字）
   chunk_size   = 6000
   chunks       = []
   for i in range(0, min(len(text), 18000), chunk_size):
@@ -291,15 +282,16 @@ def render_supports(insight_id):
           c1, c2 = st.columns([10, 1])
           with c1:
               if sup.get("original_name"):
-                  fb = get_file_bytes(sup.get("stored_name"), sup.get("file_url"))
+                  fb = get_file_bytes(sup)
                   if fb:
                       st.download_button(
                           f"📄 {sup['original_name']}",
-                          data=fb, file_name=sup["original_name"],
+                          data=fb,
+                          file_name=sup["original_name"],
                           key=f"dl_sup_{sup['id']}"
                       )
-                  elif sup.get("file_url"):
-                      st.markdown(f"[📄 {sup['original_name']}]({sup['file_url']})")
+                  else:
+                      st.caption(f"📄 {sup['original_name']}")
               if sup.get("support_text"):
                   st.caption(f"💬 {sup['support_text']}")
               if sup.get("source_name"):
@@ -438,18 +430,14 @@ def render_insight_card(ins):
                   pass
           st.divider()
           if ins.get("document_id"):
-              doc = get_document(ins["document_id"])
+              doc = get_document_with_content(ins["document_id"])
               if doc:
-                  fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
+                  fb = get_file_bytes(doc)
                   if fb:
                       st.download_button(
                           f"📄 来源文件：{doc['original_name']}",
                           data=fb, file_name=doc["original_name"],
                           key=f"dl_{ins['id']}"
-                      )
-                  elif doc.get("file_url"):
-                      st.markdown(
-                          f"[📄 来源文件：{doc['original_name']}]({doc['file_url']})"
                       )
           st.caption(
               f"来源：{ins.get('source') or '未标注'} ｜ "
@@ -487,18 +475,6 @@ def page_home():
           icon = "🌐" if ins["insight_type"] == "era" else "👥"
           with st.expander(f"{icon} {ins['title']}"):
               st.write(ins["content"])
-              if ins.get("document_id"):
-                  doc = get_document(ins["document_id"])
-                  if doc:
-                      fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
-                      if fb:
-                          st.download_button(
-                              f"📄 来源文件：{doc['original_name']}",
-                              data=fb, file_name=doc["original_name"],
-                              key=f"hdl_{ins['id']}"
-                          )
-                      elif doc.get("file_url"):
-                          st.markdown(f"[📄 {doc['original_name']}]({doc['file_url']})")
               st.caption(
                   f"来源：{ins.get('source') or '未标注'} ｜ "
                   f"{str(ins.get('created_at',''))[:10]}"
@@ -620,15 +596,15 @@ def page_docs():
               count = len(get_supabase().table("insights").select("id").eq(
                   "document_id", doc["id"]).execute().data or [])
               st.caption(f"🔗 已关联 **{count}** 条洞察")
-              fb = get_file_bytes(doc.get("stored_name"), doc.get("file_url"))
+              # 下载需要完整文档（含 file_content）
+              full_doc = get_document_with_content(doc["id"])
+              fb = get_file_bytes(full_doc)
               if fb:
                   st.download_button(
                       "📥 下载原文件", data=fb,
                       file_name=doc["original_name"],
                       key=f"doc_dl_{doc['id']}"
                   )
-              elif doc.get("file_url"):
-                  st.markdown(f"[📥 查看原文件]({doc['file_url']})")
               else:
                   st.warning("⚠️ 文件暂时无法下载")
       with col_del:
@@ -706,7 +682,7 @@ def page_ai_import():
 
   if st.button("🚀 开始 AI 提取洞察", type="primary",
                disabled=not (text and source), use_container_width=True):
-      with st.spinner("🤖 AI 正在分段分析，文档越长等待越久，请耐心等待..."):
+      with st.spinner("🤖 AI 正在分段分析，文档越长等待越久，请耐心..."):
           try:
               ins = ai_extract_insights(text)
               st.session_state["ai_results"]   = ins
